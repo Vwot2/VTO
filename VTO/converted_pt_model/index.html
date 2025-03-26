@@ -1,0 +1,729 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Real-time Hand Pose Detection</title>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+    <style>
+        body { 
+            text-align: center; 
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: #f0f0f0;
+        }
+        .container {
+            position: relative;
+            width: 640px;
+            height: 480px;
+            margin: 20px auto;
+        }
+        video, canvas { 
+            position: absolute;
+            left: 0;
+            top: 0;
+        }
+        button {
+            margin: 10px;
+            padding: 10px 20px;
+            font-size: 16px;
+            cursor: pointer;
+            background: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+        }
+        button:hover {
+            background: #0056b3;
+        }
+        #status {
+            padding: 10px;
+            background: #fff;
+            border-radius: 4px;
+            display: inline-block;
+        }
+    </style>
+</head>
+<body>
+    <h1>Real-time Hand Pose Detection (YOLOv8)</h1>
+    <button onclick="loadModel()">Load Model</button>
+    <button onclick="startWebcam()">Start Webcam</button>
+    <p id="status">Model not loaded</p>
+
+    <div class="container">
+        <video id="video" width="640" height="480" autoplay></video>
+        <canvas id="canvas" width="640" height="480"></canvas>
+    </div>
+
+    <script type="module">
+        // Kalman Filter Implementation
+        class KalmanFilter {
+            constructor(stateSize, measurementSize, processNoise = 0.001, measurementNoise = 0.1) {
+                this.state = new Array(stateSize).fill(0);         // State vector [x, y, vx, vy]
+                this.covariance = new Array(stateSize * stateSize).fill(0);
+                this.processNoise = processNoise;
+                this.measurementNoise = measurementNoise;
+                this.stateSize = stateSize;
+                this.measurementSize = measurementSize;
+
+                // Initialize covariance matrix with high uncertainty
+                for (let i = 0; i < stateSize; i++) {
+                    this.covariance[i * stateSize + i] = 1000;
+                }
+            }
+
+            predict(dt = 1/30) {
+                // State transition matrix
+                const F = new Array(this.stateSize * this.stateSize).fill(0);
+                for (let i = 0; i < this.stateSize/2; i++) {
+                    F[i * this.stateSize + i] = 1;
+                    F[i * this.stateSize + (i + this.stateSize/2)] = dt;
+                    F[(i + this.stateSize/2) * this.stateSize + (i + this.stateSize/2)] = 1;
+                }
+
+                // Predict state
+                const newState = new Array(this.stateSize).fill(0);
+                for (let i = 0; i < this.stateSize; i++) {
+                    for (let j = 0; j < this.stateSize; j++) {
+                        newState[i] += F[i * this.stateSize + j] * this.state[j];
+                    }
+                }
+                this.state = newState;
+
+                // Predict covariance
+                const newCovariance = new Array(this.stateSize * this.stateSize).fill(0);
+                for (let i = 0; i < this.stateSize; i++) {
+                    for (let j = 0; j < this.stateSize; j++) {
+                        for (let k = 0; k < this.stateSize; k++) {
+                            newCovariance[i * this.stateSize + j] += 
+                                F[i * this.stateSize + k] * this.covariance[k * this.stateSize + j];
+                        }
+                    }
+                }
+
+                // Add process noise
+                for (let i = 0; i < this.stateSize; i++) {
+                    newCovariance[i * this.stateSize + i] += this.processNoise;
+                }
+
+                this.covariance = newCovariance;
+            }
+
+            update(measurement) {
+                // Measurement matrix
+                const H = new Array(this.measurementSize * this.stateSize).fill(0);
+                for (let i = 0; i < this.measurementSize; i++) {
+                    H[i * this.stateSize + i] = 1;
+                }
+
+                // Calculate Kalman gain
+                const S = new Array(this.measurementSize * this.measurementSize).fill(0);
+                for (let i = 0; i < this.measurementSize; i++) {
+                    for (let j = 0; j < this.measurementSize; j++) {
+                        for (let k = 0; k < this.stateSize; k++) {
+                            S[i * this.measurementSize + j] += 
+                                H[i * this.stateSize + k] * this.covariance[k * this.stateSize + j];
+                        }
+                    }
+                    S[i * this.measurementSize + i] += this.measurementNoise;
+                }
+
+                const K = new Array(this.stateSize * this.measurementSize).fill(0);
+                for (let i = 0; i < this.stateSize; i++) {
+                    for (let j = 0; j < this.measurementSize; j++) {
+                        for (let k = 0; k < this.stateSize; k++) {
+                            K[i * this.measurementSize + j] += 
+                                this.covariance[i * this.stateSize + k] * H[j * this.stateSize + k];
+                        }
+                        K[i * this.measurementSize + j] /= S[j * this.measurementSize + j];
+                    }
+                }
+
+                // Update state
+                const innovation = new Array(this.measurementSize).fill(0);
+                for (let i = 0; i < this.measurementSize; i++) {
+                    innovation[i] = measurement[i];
+                    for (let j = 0; j < this.stateSize; j++) {
+                        innovation[i] -= H[i * this.stateSize + j] * this.state[j];
+                    }
+                }
+
+                for (let i = 0; i < this.stateSize; i++) {
+                    for (let j = 0; j < this.measurementSize; j++) {
+                        this.state[i] += K[i * this.measurementSize + j] * innovation[j];
+                    }
+                }
+
+                // Update covariance
+                const newCovariance = new Array(this.stateSize * this.stateSize).fill(0);
+                for (let i = 0; i < this.stateSize; i++) {
+                    for (let j = 0; j < this.stateSize; j++) {
+                        newCovariance[i * this.stateSize + j] = this.covariance[i * this.stateSize + j];
+                        for (let k = 0; k < this.measurementSize; k++) {
+                            newCovariance[i * this.stateSize + j] -= 
+                                K[i * this.measurementSize + k] * H[k * this.stateSize + j] * this.covariance[i * this.stateSize + j];
+                        }
+                    }
+                }
+                this.covariance = newCovariance;
+            }
+
+            getState() {
+                return this.state.slice(0, this.measurementSize);
+            }
+        }
+
+        let model;
+        let video = document.getElementById("video");
+        let canvas = document.getElementById("canvas");
+        let ctx = canvas.getContext("2d");
+
+        const CONF_THRESHOLD = 0.65;
+        const IOU_THRESHOLD = 0.1;
+        let isProcessing = false;
+        let previousDetections = [];
+        
+        // Tracking for historic detections to adaptively adjust scaling
+        let recentDetections = [];
+        const MAX_HISTORY = 30; // Keep track of this many recent detections
+        
+        // Detect rapid movement for dynamic scaling
+        let movementHistory = [];
+        const MOVEMENT_HISTORY_LENGTH = 10;
+        let lastHandPosition = null;
+
+        // Initialize Kalman filters
+        let bboxFilter = new KalmanFilter(8, 4, 0.03, 0.2); // State: [x, y, w, h, vx, vy, vw, vh]
+        let keypointFilter = new KalmanFilter(4, 2, 0.005, 0.2); // State: [x, y, vx, vy]
+        let lastFrameTime = performance.now();
+
+        // Model input size constants
+        const MODEL_WIDTH = 640;
+        const MODEL_HEIGHT = 640;
+        const SCALE_FACTOR = 1.8;
+        
+        // Configuration for dynamic scaling
+        const CONFIG = {
+            // Base scaling factors by zone (closer hands need more aggressive scaling)
+            scaling: {
+                veryClose: {
+                    widthFactor: 1.15,
+                    heightFactor: 1.35,
+                    baseWristOffset: 0.75 // Percentage down from top of box
+                },
+                close: {
+                    widthFactor: 1.08,
+                    heightFactor: 1.25,
+                    baseWristOffset: 0.7
+                },
+                normal: {
+                    widthFactor: 1.02,
+                    heightFactor: 1.1,
+                    baseWristOffset: 0.65
+                }
+            },
+            // Thresholds for determining hand proximity (as percentage of frame width)
+            proximity: {
+                veryCloseThreshold: 0.22,
+                closeThreshold: 0.16
+            },
+            // Movement-based adjustments
+            movement: {
+                rapidMovementThreshold: 0.025, // As percentage of frame width
+                rapidMovementScaleFactor: 1.12 // Additional scaling for rapidly moving hands
+            },
+            // Position-based adjustments (different parts of the frame)
+            position: {
+                topMarginFactor: 1.15,     // Hands near top of frame
+                bottomMarginFactor: 1.25,  // Hands near bottom of frame
+                leftMarginFactor: 1.1,     // Hands at left edge
+                rightMarginFactor: 1.1,    // Hands at right edge
+                marginThreshold: 0.15      // How close to edge is considered "at margin"
+            },
+            // Depth perception (Z-axis) estimation
+            depth: {
+                aspectRatioThreshold: 1.8,  // When width/height exceeds this, likely hand pointing at camera
+                fingerExtensionFactor: 1.3  // Scale factor for finger extension
+            }
+        };
+
+        function calculateMovementSpeed() {
+            if (movementHistory.length < 2) return 0;
+            
+            // Calculate average recent movement
+            const sum = movementHistory.reduce((a, b) => a + b, 0);
+            return sum / movementHistory.length;
+        }
+
+        function calculateIoU(box1, box2) {
+            const [x1, y1, w1, h1] = box1;
+            const [x2, y2, w2, h2] = box2;
+            
+            const x1min = x1 - w1/2;
+            const x1max = x1 + w1/2;
+            const y1min = y1 - h1/2;
+            const y1max = y1 + h1/2;
+            
+            const x2min = x2 - w2/2;
+            const x2max = x2 + w2/2;
+            const y2min = y2 - h2/2;
+            const y2max = y2 + h2/2;
+            
+            const xOverlap = Math.max(0, Math.min(x1max, x2max) - Math.max(x1min, x2min));
+            const yOverlap = Math.max(0, Math.min(y1max, y2max) - Math.max(y1min, y2min));
+            
+            const intersectionArea = xOverlap * yOverlap;
+            const union = w1 * h1 + w2 * h2 - intersectionArea;
+            
+            return intersectionArea / union;
+        }
+
+        function applyDynamicScaling(centerX, centerY, width, height, wristX, wristY, proximityClass, transformInfo) {
+            // Get base scaling parameters based on proximity
+            const scalingParams = CONFIG.scaling[proximityClass];
+            
+            // Start with base scaling factors from config
+            let widthFactor = scalingParams.widthFactor;
+            let heightFactor = scalingParams.heightFactor;
+            
+            // Calculate current box boundaries
+            let boxTop = centerY - height/2;
+            let boxBottom = centerY + height/2;
+            let boxLeft = centerX - width/2;
+            let boxRight = centerX + width/2;
+            
+            // 1. Check if hand is at frame margins and adjust scaling
+            const frameWidth = transformInfo.originalWidth;
+            const frameHeight = transformInfo.originalHeight;
+            const marginThreshold = CONFIG.position.marginThreshold;
+            
+            // Near top of frame
+            if (boxTop / frameHeight < marginThreshold) {
+                heightFactor *= CONFIG.position.topMarginFactor;
+            }
+            
+            // Near bottom of frame
+            if ((frameHeight - boxBottom) / frameHeight < marginThreshold) {
+                heightFactor *= CONFIG.position.bottomMarginFactor;
+            }
+            
+            // Near left edge
+            if (boxLeft / frameWidth < marginThreshold) {
+                widthFactor *= CONFIG.position.leftMarginFactor;
+            }
+            
+            // Near right edge
+            if ((frameWidth - boxRight) / frameWidth < marginThreshold) {
+                widthFactor *= CONFIG.position.rightMarginFactor;
+            }
+            
+            // 2. Check aspect ratio for depth perception
+            const aspectRatio = width / height;
+            if (aspectRatio > CONFIG.depth.aspectRatioThreshold) {
+                // Likely hand pointing toward camera, extend bounding box for fingers
+                widthFactor *= CONFIG.depth.fingerExtensionFactor;
+            }
+            
+            // 3. Adjust for rapid movement
+            const movementSpeed = calculateMovementSpeed();
+            if (movementSpeed > CONFIG.movement.rapidMovementThreshold) {
+                // Scale up for rapidly moving hands
+                widthFactor *= CONFIG.movement.rapidMovementScaleFactor;
+                heightFactor *= CONFIG.movement.rapidMovementScaleFactor;
+            }
+            
+            // 4. Apply wrist position logic - ensure wrist is sensibly placed
+            // If wrist is above or near top of box, it's likely wrong
+            const wristIsAboveBox = wristY < boxTop;
+            const wristIsHighInBox = wristY < (boxTop + 0.3 * height);
+            
+            if (wristIsAboveBox || wristIsHighInBox) {
+                // Place wrist at a sensible position based on proximity
+                wristY = boxTop + (scalingParams.baseWristOffset * height);
+            }
+            
+            // 5. Apply scaling to dimensions
+            const newWidth = width * widthFactor;
+            const newHeight = height * heightFactor;
+            
+            // 6. Calculate new center based on scaling changes
+            // For height, we want to bias growth downward to account for hand/arm extension
+            const verticalBias = 0.4; // 40% growth upward, 60% downward
+            const newCenterY = boxTop + (verticalBias * newHeight);
+            
+            // For width, keep centered horizontally
+            const newCenterX = centerX;
+            
+            // 7. Special case: if wrist is below box, expand to include it
+            if (wristY > boxBottom) {
+                // Calculate how much extra space we need
+                const extraHeight = (wristY - boxBottom) * 1.2; // 20% margin
+                
+                // Adjust height and center to include wrist
+                const expandedHeight = newHeight + extraHeight;
+                const expandedCenterY = boxTop + (verticalBias * expandedHeight);
+                
+                return {
+                    centerX: newCenterX,
+                    centerY: expandedCenterY,
+                    width: newWidth,
+                    height: expandedHeight,
+                    wristX, // Keep original wrist X
+                    wristY  // Keep original wrist Y if it seems reasonable
+                };
+            }
+            
+            return {
+                centerX: newCenterX,
+                centerY: newCenterY,
+                width: newWidth,
+                height: newHeight,
+                wristX, // Keep original wrist X
+                wristY  // Use adjusted wrist Y
+            };
+        }
+
+        async function applyNMS(detections) {
+            detections.sort((a, b) => b.confidence - a.confidence);
+            
+            const selected = [];
+            const active = new Set(Array(detections.length).keys());
+            
+            for (let i = 0; i < detections.length; i++) {
+                if (!active.has(i)) continue;
+                
+                selected.push(detections[i]);
+                
+                for (let j = i + 1; j < detections.length; j++) {
+                    if (!active.has(j)) continue;
+                    
+                    const iou = calculateIoU(detections[i].bbox, detections[j].bbox);
+                    if (iou >= IOU_THRESHOLD) active.delete(j);
+                }
+            }
+            
+            return selected;
+        }
+
+        function smoothDetections(currentDetections) {
+            const currentTime = performance.now();
+            const dt = (currentTime - lastFrameTime) / 1000; // Convert to seconds
+            lastFrameTime = currentTime;
+
+            return currentDetections.map(detection => {
+                // Predict next state
+                bboxFilter.predict(dt);
+                keypointFilter.predict(dt);
+
+                // Update with new measurements
+                const [x, y, width, height] = detection.bbox;
+                bboxFilter.update([x, y, width, height]);
+
+                const [kpX, kpY] = detection.keypoint;
+                keypointFilter.update([kpX, kpY]);
+
+                // Get filtered states
+                const filteredBbox = bboxFilter.getState();
+                const filteredKeypoint = keypointFilter.getState();
+
+                return {
+                    bbox: filteredBbox,
+                    confidence: detection.confidence,
+                    keypoint: filteredKeypoint,
+                    originalValues: detection.originalValues,
+                    proximityClass: detection.proximityClass
+                };
+            });
+        }
+
+        function drawDetections(detections) {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            
+            detections.forEach(detection => {
+                const [x, y, width, height] = detection.bbox;
+                const [wristX, wristY] = detection.keypoint;
+                
+                // Convert normalized coordinates to pixel values
+                const boxX = (x - width/2) * canvas.width;
+                const boxY = (y - height/2) * canvas.height;
+                const boxWidth = width * canvas.width;
+                const boxHeight = height * canvas.height;
+                
+                // Draw hand bounding box
+                ctx.strokeStyle = 'red';
+                ctx.lineWidth = 2;
+                ctx.strokeRect(boxX, boxY, boxWidth, boxHeight);
+                
+                // Draw wrist keypoint
+                const kpX = wristX * canvas.width;
+                const kpY = wristY * canvas.height;
+                
+                ctx.fillStyle = 'blue';
+                ctx.beginPath();
+                ctx.arc(kpX, kpY, 5, 0, 2 * Math.PI);
+                ctx.fill();
+                
+                // Label the keypoint
+                ctx.fillStyle = 'blue';
+                ctx.font = '12px Arial';
+                ctx.fillText('Wrist', kpX + 8, kpY - 8);
+                
+                // Draw confidence score and proximity class
+                ctx.fillStyle = 'red';
+                ctx.font = '14px Arial';
+                ctx.fillText(`Hand (${detection.proximityClass}): ${detection.confidence.toFixed(2)}`, boxX, boxY - 5);
+            });
+        }
+
+        function updateDetectionHistory(detections) {
+            // Add current detections to history
+            recentDetections.push([...detections]);
+            
+            // Limit history size
+            if (recentDetections.length > MAX_HISTORY) {
+                recentDetections.shift();
+            }
+            
+            // Update movement history for each detection
+            detections.forEach(detection => {
+                const [x, y] = detection.bbox;
+                
+                if (lastHandPosition) {
+                    const dx = x - lastHandPosition[0];
+                    const dy = y - lastHandPosition[1];
+                    const movement = Math.sqrt(dx*dx + dy*dy);
+                    
+                    movementHistory.push(movement);
+                    if (movementHistory.length > MOVEMENT_HISTORY_LENGTH) {
+                        movementHistory.shift();
+                    }
+                }
+                
+                lastHandPosition = [x, y];
+            });
+            
+            // Reset if no hands detected
+            if (detections.length === 0) {
+                lastHandPosition = null;
+                movementHistory = [];
+            }
+        }
+
+        async function processDetections(predictionTensor, transformInfo) {
+            const reshaped = tf.tidy(() => {
+                return predictionTensor.squeeze().transpose([1, 0]);
+            });
+            
+            const detectionsArray = await reshaped.array();
+            reshaped.dispose();
+            
+            let detections = [];
+            for (let i = 0; i < detectionsArray.length; i++) {
+                const detection = detectionsArray[i];
+                const confidence = detection[4];
+                
+                if (confidence > CONF_THRESHOLD) {
+                    // Extract basic detection values
+                    let centerX = detection[0];
+                    let centerY = detection[1];
+                    let width = detection[2];
+                    let height = detection[3];
+                    let wristX = detection[5];
+                    let wristY = detection[6];
+                    
+                    // Determine proximity level (normalized to model width)
+                    const handWidth = width / MODEL_WIDTH;
+                    
+                    // Classify hand proximity
+                    const isVeryClose = handWidth > CONFIG.proximity.veryCloseThreshold;
+                    const isClose = handWidth > CONFIG.proximity.closeThreshold && !isVeryClose;
+                    let proximityClass = isVeryClose ? 'veryClose' : (isClose ? 'close' : 'normal');
+
+                    // Apply proximity-based confidence threshold
+                    const proximityAdjustedThreshold = isVeryClose ? 
+                    CONF_THRESHOLD * 0.85 : CONF_THRESHOLD;
+
+                    if (confidence > proximityAdjustedThreshold) {
+                        // Adjust for padding in the preprocessed image
+                        centerX = (centerX - transformInfo.offsetX) / transformInfo.scale;
+                        centerY = (centerY - transformInfo.offsetY) / transformInfo.scale;
+                        width = width / transformInfo.scale;
+                        height = height / transformInfo.scale;
+                        
+                        wristX = (wristX - transformInfo.offsetX) / transformInfo.scale;
+                        wristY = (wristY - transformInfo.offsetY) / transformInfo.scale;
+                        
+                        // Store original values for reference
+                        const originalWidth = width;
+                        const originalHeight = height;
+                        const originalCenterX = centerX;
+                        const originalCenterY = centerY;
+                        const originalWristX = wristX;
+                        const originalWristY = wristY;
+                        
+                        // Calculate current box boundaries
+                        let boxTop = centerY - height/2;
+                        let boxBottom = centerY + height/2;
+                        let boxLeft = centerX - width/2;
+                        let boxRight = centerX + width/2;
+                        
+                        // Apply dynamic bounding box scaling
+                        const scaledDimensions = applyDynamicScaling(
+                            centerX, centerY, width, height, wristX, wristY,
+                            proximityClass, transformInfo
+                        );
+                        
+                        // Update with new scaled dimensions
+                        centerX = scaledDimensions.centerX;
+                        centerY = scaledDimensions.centerY;
+                        width = scaledDimensions.width;
+                        height = scaledDimensions.height;
+                        wristX = scaledDimensions.wristX;
+                        wristY = scaledDimensions.wristY;
+                        
+                        // Normalize to [0,1] for easier drawing
+                        const normalizedX = centerX / transformInfo.originalWidth;
+                        const normalizedY = centerY / transformInfo.originalHeight;
+                        const normalizedWidth = width / transformInfo.originalWidth * SCALE_FACTOR;
+                        const normalizedHeight = height / transformInfo.originalHeight * SCALE_FACTOR;
+                        
+                        const normalizedWristX = wristX / transformInfo.originalWidth;
+                        const normalizedWristY = wristY / transformInfo.originalHeight;
+                        
+                        // Ensure values are within bounds
+                        const x = Math.max(0, Math.min(1, normalizedX));
+                        const y = Math.max(0, Math.min(1, normalizedY));
+                        const w = Math.max(0.01, Math.min(1, normalizedWidth));
+                        const h = Math.max(0.01, Math.min(1, normalizedHeight));
+                        
+                        const kpX = Math.max(0, Math.min(1, normalizedWristX));
+                        const kpY = Math.max(0, Math.min(1, normalizedWristY));
+                        
+                        detections.push({
+                            bbox: [x, y, w, h],
+                            confidence,
+                            keypoint: [kpX, kpY],
+                            originalValues: {
+                                width: originalWidth,
+                                height: originalHeight,
+                                centerX: originalCenterX,
+                                centerY: originalCenterY,
+                                wristX: originalWristX,
+                                wristY: originalWristY
+                            },
+                            proximityClass
+                        });
+                    }
+                }
+            }
+            
+            return applyNMS(detections);
+        }
+
+        async function loadModel() {
+            try {
+                document.getElementById("status").innerText = "Loading model...";
+                model = await tf.loadGraphModel('http://localhost:8000/model.json');
+                document.getElementById("status").innerText = "Model loaded!";
+                console.log("Model loaded successfully");
+            } catch (error) {
+                console.error("Error loading model:", error);
+                document.getElementById("status").innerText = "Error loading model!";
+            }
+        }
+
+        async function startWebcam() {
+            if (!model) {
+                alert("Please load the model first!");
+                return;
+            }
+
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    video: { 
+                        width: { ideal: 640 },
+                        height: { ideal: 480 },
+                        facingMode: 'user'
+                    } 
+                });
+                video.srcObject = stream;
+                video.onloadedmetadata = () => {
+                    video.play();
+                    processVideoFrame();
+                };
+            } catch (err) {
+                console.error("Error accessing webcam:", err);
+                document.getElementById("status").innerText = "Error accessing webcam!";
+            }
+        }
+
+        async function processVideoFrame() {
+            if (!model || !video.videoWidth || isProcessing) return;
+            
+            try {
+                isProcessing = true;
+                
+                const offscreenCanvas = document.createElement('canvas');
+                offscreenCanvas.width = MODEL_WIDTH;
+                offscreenCanvas.height = MODEL_HEIGHT;
+                const offscreenCtx = offscreenCanvas.getContext('2d');
+                
+                const scale = Math.min(MODEL_WIDTH / video.videoWidth, MODEL_HEIGHT / video.videoHeight);
+                const scaledWidth = video.videoWidth * scale;
+                const scaledHeight = video.videoHeight * scale;
+                const offsetX = (MODEL_WIDTH - scaledWidth) / 2;
+                const offsetY = (MODEL_HEIGHT - scaledHeight) / 2;
+                
+                offscreenCtx.fillStyle = 'black';
+                offscreenCtx.fillRect(0, 0, MODEL_WIDTH, MODEL_HEIGHT);
+                offscreenCtx.drawImage(video, offsetX, offsetY, scaledWidth, scaledHeight);
+                
+                const imgTensor = tf.tidy(() => {
+                    const tensor = tf.browser.fromPixels(offscreenCanvas)
+                        .expandDims(0)
+                        .toFloat()
+                        .div(255.0); 
+                    
+                    return tensor;
+                });
+                
+                const predictions = await model.predict(imgTensor);
+                imgTensor.dispose();
+                
+                const processedDetections = await processDetections(predictions, {
+                    offsetX,
+                    offsetY,
+                    scale,
+                    originalWidth: video.videoWidth,
+                    originalHeight: video.videoHeight
+                });
+                
+                const smoothedDetections = smoothDetections(processedDetections);
+                drawDetections(smoothedDetections);
+                
+                // Store for velocity calculation and adaptive scaling
+                updateDetectionHistory(smoothedDetections);
+                
+                previousDetections = smoothedDetections;
+                
+                if (Array.isArray(predictions)) {
+                    predictions.forEach(p => p.dispose());
+                } else {
+                    predictions.dispose();
+                }
+                
+            } catch (error) {
+                console.error("Error in processing frame:", error);
+            } finally {
+                isProcessing = false;
+                requestAnimationFrame(processVideoFrame);
+            }
+        }
+
+        window.loadModel = loadModel;
+        window.startWebcam = startWebcam;
+    </script>
+</body>
+</html>

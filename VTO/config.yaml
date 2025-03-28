@@ -1,0 +1,23 @@
+paths: 
+  hand_img_dir: ""
+  non_hand_dir: ""        
+  annotations_dir: ""
+  output_dir: ""
+
+
+model:
+  size: "n"  # Options: n (nano), s (small), m (medium), l (large), x (xlarge)
+  epochs: 50  # Number of training epochs
+  image_size: 224  # Input image size
+  batch_size: 16  # Batch size for training
+  pretrained: true  # Use pretrained weights
+  conf_thres: 0.25  # Confidence threshold for detection
+  iou_thres: 0.45  # IoU threshold for NMS
+  device: ""  # Device selection (empty string for auto-selection)
+
+training:
+  train_ratio: 0.7
+  val_ratio: 0.15
+  seed: 42
+
+

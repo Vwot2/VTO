@@ -1,8 +1,6 @@
 This project contains a full pipeline for training a machine learning model for hand recognition. It includes data preparation, training scripts, model conversion, and deployment files.
 
 
-ML_HandModel/ – Contains the full pipeline for preparing images, annotations, and training the model, there is also a webcam script after the training is done to test the model
-
 best.pt – The trained PyTorch model file.
 
 config.yaml – Configuration settings used during training.
